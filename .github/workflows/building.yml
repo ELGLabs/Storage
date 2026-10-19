@@ -1,4 +1,4 @@
-name: Building
+name: Building | Onine DLU
 
 on:
   workflow_dispatch:
