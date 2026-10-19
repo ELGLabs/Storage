@@ -1,0 +1,159 @@
+name: Building
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit SHA of Online-DLU'
+        required: false
+        default: 'main'
+        type: string
+
+concurrency:
+  group: building-${{ github.ref }}-${{ inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.2
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: false
+          remove_dotnet: true
+          remove_haskell: false
+          remove_tool_cache: false
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: false
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Dựng bản đồ 3D
+        env:
+          DLU_MAP_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 tool/build_map.py
+
+      - run: flutter pub get
+      - run: flutter analyze --no-pub
+      - run: flutter test --no-pub
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: false
+          remove_dotnet: true
+          remove_haskell: false
+          remove_tool_cache: false
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: false
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Dựng bản đồ 3D theo tool/dlu_map.ref
+        env:
+          DLU_MAP_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 tool/build_map.py
+
+      - run: flutter pub get
+      - run: flutter build apk --debug
+
+      - name: Đặt tên file
+        run: |
+          mkdir -p out
+          SHA="$(git rev-parse --short HEAD)"
+          cp build/app/outputs/flutter-apk/app-debug.apk \
+            "out/OnlineDLU-debug-${SHA}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: out/*.apk
+          retention-days: 14
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Dựng bản đồ 3D theo tool/dlu_map.ref
+        env:
+          DLU_MAP_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 tool/build_map.py
+
+      - run: flutter pub get
+      - run: flutter build ios --release --no-codesign
+
+      - name: Đóng gói IPA chưa ký
+        run: |
+          mkdir -p out Payload
+          SHA="$(git rev-parse --short HEAD)"
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry "out/OnlineDLU-unsigned-${SHA}.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: out/*.ipa
+          retention-days: 14
