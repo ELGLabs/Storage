@@ -1,4 +1,4 @@
-name: Release
+name: Release | Onine DLU
 
 on:
   workflow_dispatch:
