@@ -271,7 +271,10 @@ jobs:
           name: ${{ needs.prepare.outputs.tag }}
           files: dist/${{ needs.prepare.outputs.release_tag }}.aab
           fail_on_unmatched_files: true
-          body: |
-            Bản đóng gói Android App Bundle (AAB) cho Google Play Store.
+        body: |
+          Bản nộp Google Play (`.aab`) của ${{ needs.prepare.outputs.tag }}.
+          APK và IPA nằm ở https://github.com/ELGLabs/Release/releases/tag/${{ needs.prepare.outputs.release_tag }}
 
-            Tag: ${{ needs.prepare.outputs.tag }}
+          ## Có gì mới
+
+          ${{ needs.prepare.outputs.notes }}
