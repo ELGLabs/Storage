@@ -1,0 +1,277 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag phiên bản (vd: v1.5.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.2
+
+jobs:
+  prepare:
+    name: Kiểm tra và chuẩn bị tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag_logic.outputs.tag }}
+      release_tag: ${{ steps.tag_logic.outputs.release_tag }}
+      notes: ${{ steps.tag_logic.outputs.notes }}
+    steps:
+      - name: Checkout Online-DLU
+        uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          token: ${{ secrets.GH_TOKEN }}
+          fetch-depth: 0
+
+      - name: Xử lý tag và ghi chú
+        id: tag_logic
+        run: |
+          RAW_TAG="${{ inputs.tag }}"
+          if [[ "$RAW_TAG" =~ ^v ]]; then
+            TAG="$RAW_TAG"
+          else
+            TAG="v$RAW_TAG"
+          fi
+          RELEASE_TAG="OnlineDLU-$TAG"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG đã tồn tại trên remote. Sử dụng tag hiện có."
+            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+            git checkout "$TAG"
+          else
+            echo "Tag $TAG chưa tồn tại. Tạo tag mới từ nhánh main..."
+            git checkout main
+            git pull origin main
+
+            python3 tool/version.py check "$TAG"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Online DLU $TAG"
+            git push origin "$TAG"
+            echo "Đã push tag $TAG lên ELGLabs/Online-DLU."
+          fi
+
+          python3 tool/version.py check "$TAG"
+          {
+            echo 'notes<<EOF'
+            python3 tool/version.py notes
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+  android:
+    name: Build Android (AAB + APK)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Online-DLU
+        uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.GH_TOKEN }}
+          persist-credentials: false
+
+      - uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: false
+          remove_dotnet: true
+          remove_haskell: false
+          remove_tool_cache: false
+          remove_swap: false
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: false
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Lấy khoá ký từ submodule keystore (ELGLabs/KeyStore)
+        env:
+          KEYSTORE_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if [ -z "$KEYSTORE_TOKEN" ]; then
+            echo "::error::Thiếu token đọc KeyStore."
+            exit 1
+          fi
+          cap=$(printf 'x-access-token:%s' "$KEYSTORE_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $cap" \
+              -c submodule.keystore.update=checkout \
+              submodule update --init keystore
+          test -f keystore/KeyStore.jks
+
+      - name: Dựng key.properties từ secret
+        env:
+          MAT_KHAU_KY: ${{ secrets.SIGN_PASSWORD }}
+        run: |
+          if [ -z "$MAT_KHAU_KY" ]; then
+            echo "::error::Thiếu secret SIGN_PASSWORD."
+            exit 1
+          fi
+          printf 'store%s=%s\n' "Password" "$MAT_KHAU_KY" > android/key.properties
+          printf 'key%s=%s\n' "Password" "$MAT_KHAU_KY" >> android/key.properties
+          echo "keyAlias=elglabs" >> android/key.properties
+          echo "storeFile=../../keystore/KeyStore.jks" >> android/key.properties
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Dựng bản đồ 3D theo tool/dlu_map.ref
+        env:
+          DLU_MAP_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 tool/build_map.py
+
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+      - name: Build AAB và APK
+        run: |
+          flutter build appbundle --release --dart-define=KENH=store
+          flutter build apk --release --dart-define=KENH=github
+
+      - name: Kiểm chứng ký bằng khoá ELGLabs
+        run: |
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+          "$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk \
+            | tee /dev/stderr | grep -q 'certificate DN: CN=ELGLabs' || {
+              echo "::error::APK không ký bằng khoá ELGLabs."
+              exit 1
+            }
+          keytool -printcert -jarfile build/app/outputs/bundle/release/app-release.aab \
+            | tee /dev/stderr | grep -q 'Owner: CN=ELGLabs' || {
+              echo "::error::AAB không ký bằng khoá ELGLabs."
+              exit 1
+            }
+
+      - name: Đặt tên file theo tag
+        run: |
+          mkdir -p out
+          cp build/app/outputs/bundle/release/app-release.aab "out/${{ needs.prepare.outputs.release_tag }}.aab"
+          cp build/app/outputs/flutter-apk/app-release.apk "out/${{ needs.prepare.outputs.release_tag }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*
+
+  ios:
+    name: Build iOS (IPA)
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Online-DLU
+        uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Dựng bản đồ 3D theo tool/dlu_map.ref
+        env:
+          DLU_MAP_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 tool/build_map.py
+
+      - run: flutter pub get
+
+      - name: Build IPA chưa ký
+        run: |
+          flutter build ios --release --no-codesign --dart-define=KENH=github
+          mkdir -p out Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry "out/${{ needs.prepare.outputs.release_tag }}.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: out/*
+
+  publish:
+    name: Phát hành Release & AAB
+    needs: [prepare, android, ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Tải các file đã build
+        uses: actions/download-artifact@v4
+        with:
+          path: files
+
+      - name: Gom file phát hành
+        run: |
+          mkdir -p dist
+          find files -type f -name "*.apk" -exec cp {} dist/ \;
+          find files -type f -name "*.ipa" -exec cp {} dist/ \;
+          find files -type f -name "*.aab" -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: APK + IPA lên ELGLabs/Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ELGLabs/Release
+          token: ${{ secrets.GH_TOKEN }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_tag }}
+          files: |
+            dist/${{ needs.prepare.outputs.release_tag }}.apk
+            dist/${{ needs.prepare.outputs.release_tag }}.ipa
+          fail_on_unmatched_files: true
+          body: |
+            Online DLU ${{ needs.prepare.outputs.tag }} — ứng dụng không chính thức cho sinh viên Trường Đại học Đà Lạt.
+
+            ## Có gì mới
+
+            ${{ needs.prepare.outputs.notes }}
+
+            ## Tải về
+
+            - `${{ needs.prepare.outputs.release_tag }}.apk` — cài thẳng lên Android 7.0 trở lên
+            - `${{ needs.prepare.outputs.release_tag }}.ipa` — iOS 15 trở lên, chưa ký: tự ký bằng Sideloadly, AltStore hoặc LiveContainer
+
+      - name: AAB lên Online-DLU
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ELGLabs/Online-DLU
+          token: ${{ secrets.GH_TOKEN }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          files: dist/${{ needs.prepare.outputs.release_tag }}.aab
+          fail_on_unmatched_files: true
+          body: |
+            Bản đóng gói Android App Bundle (AAB) cho Google Play Store.
+
+            Tag: ${{ needs.prepare.outputs.tag }}
