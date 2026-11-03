@@ -1,0 +1,97 @@
+name: PWA | Onine DLU
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit SHA of Online-DLU'
+        required: false
+        default: 'main'
+        type: string
+
+concurrency:
+  group: pwa-${{ github.ref }}-${{ inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.2
+
+jobs:
+  deploy:
+    name: Deploy PWA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Online-DLU
+        uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Dựng bản đồ 3D theo tool/dlu_map.ref
+        env:
+          DLU_MAP_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 tool/build_map.py
+
+      - run: flutter pub get
+
+      # Rào iOS và proxy LMS nằm trong JS, test Dart không với tới.
+      - name: Kiểm rào iOS và proxy LMS
+        run: |
+          node tool/test_ios_gate.mjs
+          node tool/test_lms_proxy.mjs
+          node tool/test_pwa.mjs
+          node tool/test_push.mjs
+
+      - run: flutter build web --release --no-web-resources-cdn
+
+      - name: Chặn artifact debug khỏi bản phát hành
+        run: |
+          lo="$(find build/web -type f \( -name '*.map' -o -name '*.dill' -o -name 'main.dart.js.symbols' \) -print -quit)"
+          if [ -n "$lo" ]; then
+            echo "::error::Bản web chứa artifact debug: $lo"
+            exit 1
+          fi
+
+      - name: Lấy SHA của Online-DLU
+        id: sha
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Lấy repo PWA về
+        uses: actions/checkout@v4
+        with:
+          repository: ELGLabs/Online-DLU-PWA
+          token: ${{ secrets.GH_TOKEN }}
+          path: out/pwa
+
+      - name: Xếp file vào repo PWA
+        run: |
+          mkdir -p out/pwa/public out/pwa/src
+          rsync -a --delete build/web/ out/pwa/public/
+          cp tool/pwa/_headers out/pwa/public/_headers
+          cp tool/pwa/wrangler.toml out/pwa/wrangler.toml
+          cp tool/pwa/src/index.js out/pwa/src/index.js
+          cp tool/pwa/README.md out/pwa/README.md
+
+      - name: Push
+        working-directory: out/pwa
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'Không có gì đổi, bỏ qua.'
+            exit 0
+          fi
+          git commit -m "Build web từ Online-DLU@${{ steps.sha.outputs.sha }}"
+          git push
